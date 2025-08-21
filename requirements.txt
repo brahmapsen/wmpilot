@@ -1,0 +1,7 @@
+python-dotenv
+openai
+fastapi
+uvicorn
+requests
+pydantic
+# mcp
