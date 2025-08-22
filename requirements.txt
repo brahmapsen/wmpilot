@@ -1,7 +1,18 @@
-python-dotenv
-openai
-fastapi
-uvicorn
-requests
-pydantic
-# mcp
+fastapi>=0.110
+uvicorn[standard]>=0.23
+pydantic>=2.4,<3.0
+python-dotenv>=1.0
+requests>=2.31
+
+# Agentic stack
+langchain>=0.2
+langgraph>=0.2
+langchain-openai>=0.1.7
+openai>=1.30
+
+# Optional tracing/observability (enable via env vars)
+langsmith>=0.1.53
+
+#mcp
+
+
