@@ -28,7 +28,10 @@ USDA_API_KEY = os.getenv("USDA_API_KEY")  # optional
 NUTRITIONIX_APP_ID = os.getenv("NUTRITIONIX_APP_ID")  # optional
 NUTRITIONIX_API_KEY = os.getenv("NUTRITIONIX_API_KEY")  # optional
 
+
 MODEL = "openai/gpt-5-chat-latest"
+# MODEL = "openai/gpt-4o"
+# MODEL = "openai/gpt-5-mini-2025-08-07"
 # MODEL = "openai/gpt-5-2025-08-07"
 
 if not AIML_API_KEY:
@@ -193,6 +196,7 @@ SYSTEM_PROMPT = """You are a nutrition & weight-management assistant for educati
 - Respect allergies, dietary restrictions, and cultural preferences. Do NOT change calories based on race/ethnicity; use them only to tailor menu ideas.
 - Prefer whole foods, moderate added sugars, sodium ~≤2300 mg/day unless otherwise specified.
 - You may call tools (USDA/Nutritionix) to check nutrition. If keys are missing, proceed without tools.
+- When generating a 7-day plan, call usda_search_foods at most 1–2 times to ground kcal/macros for representative items, not for every row.
 - Output: short intro, then a 7-day Markdown table (breakfast/lunch/dinner/snack) with approximate kcal/macros per meal and daily totals. End with a brief safety disclaimer.
 """
 
@@ -218,137 +222,320 @@ class PlanResponse(BaseModel):
     targets: Dict[str, Any]
     plan_markdown: str = Field(..., description="Markdown plan")
 
+
+# Put this helper near your tool functions
+KEY_NUTRIENTS = {
+    208: "kcal",        # Energy (KCAL)
+    203: "protein_g",   # Protein
+    205: "carbs_g",     # Carbohydrate
+    204: "fat_g",       # Total fat
+    291: "fiber_g",     # Fiber
+    307: "sodium_mg",   # Sodium
+}
+
+def _extract_macros(food_item: dict) -> dict:
+    out = {v: None for v in KEY_NUTRIENTS.values()}
+    for fn in food_item.get("foodNutrients", []):
+        nid = fn.get("nutrientId")
+        if nid in KEY_NUTRIENTS:
+            label = KEY_NUTRIENTS[nid]
+            out[label] = fn.get("value")
+    return out
+
+def compact_usda_search_result(payload: dict, top_k: int = 3) -> dict:
+    foods = payload.get("foods", [])[:top_k]
+    compact = []
+    for f in foods:
+        compact.append({
+            "fdcId": f.get("fdcId"),
+            "description": f.get("description"),
+            "dataType": f.get("dataType"),
+            "publishedDate": f.get("publishedDate"),
+            "category": f.get("foodCategory"),
+            "brandOwner": f.get("brandOwner"),
+            **_extract_macros(f),
+        })
+    return {
+        "totalHits": payload.get("totalHits"),
+        "returned": len(compact),
+        "items": compact,
+    }
+
+def compact_usda_details(food: dict) -> dict:
+    def macros():
+        out = {v: None for v in KEY_NUTRIENTS.values()}
+        for fn in food.get("foodNutrients", []):
+            nid = fn.get("nutrientId")
+            if nid in KEY_NUTRIENTS:
+                out[KEY_NUTRIENTS[nid]] = fn.get("value")
+        return out
+
+    # pick a couple of portion options if present
+    portions = []
+    for p in (food.get("foodPortions") or [])[:2]:
+        portions.append({
+            "mass_g": p.get("gramWeight"),
+            "measure": p.get("portionDescription") or p.get("modifier"),
+        })
+
+    return {
+        "fdcId": food.get("fdcId"),
+        "description": food.get("description"),
+        "dataType": food.get("dataType"),
+        "brandOwner": food.get("brandOwner"),
+        "servingSize": food.get("servingSize"),
+        "servingSizeUnit": food.get("servingSizeUnit"),
+        "macros": macros(),
+        "portions": portions,
+    }
+
 # -------------------------
 # GPT tool loop
 # -------------------------
-
 def run_response_with_tools(message: str, force_tool: str | None = None) -> str:
+    """
+    Multi-round tool loop:
+      Round 1: model may call usda_search_foods (optionally forced)
+      Round 2: model may call usda_food_details with an fdc_id from search
+      Final:   model returns the plan text
+    """
+    logger.info(f"DEBUG: force_tool parameter = {force_tool}")
+
+    # Make BOTH tools available to the model
     tools = [
         {
             "type": "function",
             "function": {
                 "name": "usda_search_foods",
-                "description": "Search USDA FoodData Central.",
+                "description": "Search USDA FoodData Central for foods matching a query.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string"},
-                        "page_size": {"type": "integer", "minimum": 1, "maximum": 25}
+                        "query": {"type": "string", "description": "Food to search (e.g., 'oatmeal')"},
+                        "page_size": {"type": "integer", "minimum": 1, "maximum": 1, "default": 1}
                     },
-                    "required": ["query"]
+                    "required": ["query"],
+                    "additionalProperties": False
                 }
             }
-        }
-    ]
-    functions = [
+        },
         {
-            "name": "usda_search_foods",
-            "description": "Search USDA FoodData Central.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "page_size": {"type": "integer", "minimum": 1, "maximum": 25, "default": 5}
-                },
-                "required": ["query"],
-                "additionalProperties": False
+            "type": "function",
+            "function": {
+                "name": "usda_food_details",
+                "description": "Fetch USDA FoodData Central details by FDC ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"fdc_id": {"type": "integer"}},
+                    "required": ["fdc_id"],
+                    "additionalProperties": False
+                }
             }
-        }
+        },
     ]
 
+    # Nudge the model toward the two-step flow, and to keep calls minimal
+    sys = SYSTEM_PROMPT + (
+        "\n\nYou have two tools:\n"
+        "1) usda_search_foods(query, page_size) → shortlist candidates with fdcId and rough macros.\n"
+        "2) usda_food_details(fdc_id) → one item's authoritative serving sizes and full nutrient panel.\n"
+        "Workflow: If you want accurate macros for a representative item, first call search, choose the best match,\n"
+        "then call details ONCE with that fdcId. Do not call tools for every row in the 7-day plan.\n"
+    )
+
     messages = [
-        {"role": "system", "content": (
-            SYSTEM_PROMPT +
-            "\n\nYou have a function/tool named 'usda_search_foods'. "
-            "When asked to check nutrition or when proposing meals, call it."
-        )},
+        {"role": "system", "content": sys},
         {"role": "user", "content": message}
     ]
 
-    # Encourage or force tool use
-    tool_choice = {"type": "function", "function": {"name": force_tool}} if force_tool else "auto"
+    # Map tool name → Python impl + compactor
+    def _exec_tool(name: str, args: dict) -> dict:
+        if name == "usda_search_foods":
+            raw = usda_search_foods(**args)
+            return compact_usda_search_result(raw, top_k=min(args.get("page_size", 3), 5))
+        elif name == "usda_food_details":
+            raw = usda_food_details(**args)
+            return compact_usda_details(raw)
+        else:
+            return {"error": f"Unknown tool '{name}'"}
 
+    # Up to 3 rounds of (assistant→tool→assistant). Usually 2 is enough (search→details).
+    max_rounds = 3
+    for round_idx in range(max_rounds):
+        # Force the first call if requested; auto thereafter
+        tool_choice = {"type": "function", "function": {"name": force_tool}} if (round_idx == 0 and force_tool) else "auto"
 
-    resp = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=MODEL,
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
-            temperature=0.3,
-            max_tokens=512,           # avoid finish_reason=length
+            temperature=0.2,
+            max_tokens=700,
         )
-    msg = resp.choices[0].message
-    logger.info(f"[tools] finish={resp.choices[0].finish_reason}; tool_calls={getattr(msg, 'tool_calls', None)}")
 
-    if getattr(msg, "tool_calls", None):
-        # 2) Execute tools, append results as `role="tool"` messages
-        for tc in msg.tool_calls:
-            args = json.loads(tc.function.arguments or "{}")
-            result = usda_search_foods(**args)  # your python function
-            logger.info(f"\n Appending to message: ")
+        msg = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None)
+        logger.info(f"[tools r{round_idx}] finish={resp.choices[0].finish_reason}; tool_calls={tool_calls}")
+
+        # If the model produced a normal answer, return it
+        if not tool_calls:
+            return msg.content or ""
+
+        # Append the assistant turn with tool_calls; content must not be None
+        messages.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                }
+                for tc in tool_calls
+            ]
+        })
+
+        # Execute each tool and append compact result
+        for tc in tool_calls:
+            tname = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except Exception:
+                args = {}
+
+            result = _exec_tool(tname, args)
+
+            payload = json.dumps(result, ensure_ascii=False)
+            # Defensive cap for providers that enforce request size limits
+            if len(payload) > 15000:
+                payload = payload[:15000] + "...(truncated)"
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": json.dumps(result)
+                "content": payload
             })
-        # 3) Ask model again to produce the final answer
-        resp2 = client.chat.completions.create(
-            model=MODEL,
-            messages=messages
-        )
-        final_text = resp2.choices[0].message.content
-    else:
-        logger.info(f"\n No tool calling: ")
-        final_text = msg.content
 
-    return final_text
+        # Loop continues to let the model integrate tool outputs and either:
+        # - call another tool (e.g., details after search), or
+        # - produce the final answer next round
 
-def run_response_with_tools1(message: str) -> str:
-    """
-    Minimal tool loop:
-      1) Call Responses API
-      2) If there are tool calls, execute and send tool_outputs back
-      3) Return final text
-    """
-    resp = client.responses.create(
+    # Fallback: if we exit the loop without a plain answer, ask once more for completion
+    resp_final = client.chat.completions.create(
         model=MODEL,
-        instructions=SYSTEM_PROMPT,
-        input=message,
-        # tools=FUNCTION_TOOLS,
-        # verbosity="low",
-        # reasoning={"effort": "medium"},
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1200,
     )
+    return resp_final.choices[0].message.content or ""
 
-    logger.info(f"\n First RESPONSE complete: ")
+#############
 
-    # Execute at most a few tool rounds to avoid runaway loops in demos
-    # for _ in range(3):
-    #     tool_calls = [item for item in resp.output if getattr(item, "type", "") == "tool_call"]
-    #     if not tool_calls:
-    #         break
+# def run_response_with_tools(message: str, force_tool: str | None = None) -> str:
+#     logger.info(f"DEBUG: force_tool parameter = {force_tool}")
+    
+#     tools = [
+#         {
+#             "type": "function",
+#             "function": {
+#                 "name": "usda_search_foods",
+#                 "description": "Search USDA FoodData Central for foods matching a query.",
+#                 "parameters": {
+#                     "type": "object",
+#                     "properties": {
+#                         "query": {"type": "string", "description": "The food item to search for"},
+#                         "page_size": {"type": "integer", "minimum": 1, "maximum": 1, "default": 1}
+#                     },
+#                     "required": ["query"],
+#                     "additionalProperties": False
+#                 }
+#             }
+#         }
+#     ]
 
-    #     tool_outputs = []
-    #     for call in tool_calls:
-    #         name = call.name
-    #         args = call.input if hasattr(call, "input") else {}
-    #         py_fn = PY_TOOL_IMPLS.get(name)
-    #         try:
-    #             result = py_fn(**args) if py_fn else {"error": f"Unknown tool {name}"}
-    #         except Exception as e:
-    #             result = {"error": str(e)}
-    #         tool_outputs.append({"call_id": call.call_id, "output": json.dumps(result)})
+#     messages = [
+#         {"role": "system", "content": SYSTEM_PROMPT},
+#         {"role": "user", "content": message}
+#     ]
 
-    #     resp = client.responses.create(
-    #         model=MODEL,
-    #         instructions=SYSTEM_PROMPT,
-    #         input=[{"role": "user", "content": message}],
-    #         tools=FUNCTION_TOOLS,
-    #         tool_outputs=tool_outputs,
-    #         # verbosity="low",
-    #         reasoning={"effort": "medium"},
-    #     )
+#     # Encourage or force tool use
+#     if force_tool:
+#         tool_choice = {"type": "function", "function": {"name": force_tool}}
+#     else:
+#         tool_choice = "auto"
+    
+#     logger.info(f"DEBUG: tool_choice = {tool_choice}")
+#     # logger.info(f"DEBUG: tools = {json.dumps(tools, indent=2)}")
 
-    return getattr(resp, "output_text", "") or ""
+#     try:
+#         resp = client.chat.completions.create(
+#                 model=MODEL,
+#                 messages=messages,
+#                 tools=tools,
+#                 tool_choice=tool_choice,
+#                 # max_tokens=1200,
+#                 # temperature=0.3
+#             )
+#         msg = resp.choices[0].message
+#         logger.info(f"[tools] finish={resp.choices[0].finish_reason}; tool_calls={getattr(msg, 'tool_calls', None)}")
+
+#         tool_calls = getattr(msg, "tool_calls", None)
+#         if not tool_calls:
+#             # No tool used; just return the text
+#             return msg.content or ""
+        
+#         # Append the assistant message with tool_calls and **content=""** (not None)
+#         messages.append({
+#             "role": "assistant",
+#             "content": msg.content or "",   # <-- never None
+#             "tool_calls": [
+#                 {
+#                     "id": tc.id,
+#                     "type": "function",
+#                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+#                 }
+#                 for tc in tool_calls
+#             ]
+#         })
+
+#         # Execute tool calls and append compacted results
+#         for tc in tool_calls:
+#             try:
+#                 args = json.loads(tc.function.arguments or "{}")
+#             except Exception:
+#                 args = {}
+
+#             raw = usda_search_foods(**args)             # your HTTP call
+#             compact = compact_usda_search_result(raw, top_k=min(args.get("page_size", 3), 5))
+
+#             # optional hard cap for safety in providers that enforce body size limits
+#             tool_payload = json.dumps(compact, ensure_ascii=False)
+#             if len(tool_payload) > 15000:
+#                 tool_payload = tool_payload[:15000] + "...(truncated)"
+
+#             messages.append({
+#                 "role": "tool",
+#                 "tool_call_id": tc.id,
+#                 "content": tool_payload
+#             })
+
+#         # === Second turn: ask model to finalize using tool outputs ===
+#         resp2 = client.chat.completions.create(
+#             model=MODEL,
+#             messages=messages,
+#             temperature=0.2,
+#             max_tokens=1200,
+#         )
+#         return resp2.choices[0].message.content or ""
+
+#     except Exception as e:
+#         logger.error(f"ERROR in run_response_with_tools: {str(e)}")
+#         raise
+
+#     return final_text
+
+
 
 # -------------------------
 # Routes
@@ -394,7 +581,7 @@ def create_plan(req: PlanRequest, x_api_key: Optional[str] = Header(default=None
     )
 
     try:
-        plan_md = run_response_with_tools(prompt, force_tool="usda_search_foods")
+        plan_md = run_response_with_tools(prompt,force_tool="usda_search_foods")
     except requests.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"Upstream HTTP error: {str(e)}")
     except Exception as e:
