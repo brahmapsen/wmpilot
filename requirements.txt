@@ -13,6 +13,10 @@ openai>=1.30
 # Optional tracing/observability (enable via env vars)
 langsmith>=0.1.53
 
+
+# vapi
+vapi-python
+
 #mcp
 
 

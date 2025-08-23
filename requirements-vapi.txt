@@ -1,0 +1,10 @@
+# Vapi Python SDK
+vapi-python>=1.0.0
+
+# Web frameworks (optional - uncomment as needed)
+# flask>=2.0.0
+# fastapi>=0.100.0
+# uvicorn>=0.23.0
+
+# Utilities
+python-dotenv>=1.0.0
